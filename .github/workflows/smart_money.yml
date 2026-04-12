@@ -1,0 +1,38 @@
+name: pipeline
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */4 * * 1-5"
+    - cron: "0 8,20 * * 0,6"
+env:
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install polars requests
+      - uses: actions/cache@v4
+        with:
+          path: goldsky/orderFilled.csv
+          key: goldsky-${{ github.run_number }}
+          restore-keys: goldsky-
+      - name: Get data
+        run: |
+          if [ ! -f goldsky/orderFilled.csv ]; then
+            mkdir -p goldsky
+            curl -L -o goldsky/orderFilled.csv.xz https://polydata-archive.s3.us-east-1.amazonaws.com/orderFilled_complete.csv.xz
+            xz -d goldsky/orderFilled.csv.xz
+          fi
+      - name: Update
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync
+          uv run python update_all.py
+      - run: python smart_money_direct.py --poly-data-dir .
