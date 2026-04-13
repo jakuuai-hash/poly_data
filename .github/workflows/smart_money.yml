@@ -7,10 +7,11 @@ on:
 env:
   CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # S86: preempt June 2026 deprecation
 jobs:
   smart-money:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # S86: API mode runs in ~30s, no more 37GB download
+    timeout-minutes: 10
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
