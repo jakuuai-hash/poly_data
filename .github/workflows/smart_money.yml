@@ -1,8 +1,8 @@
 name: JAKUU Smart Money Pipeline
 on:
   schedule:
-    - cron: "0 */4 * * 1-5"
-    - cron: "0 8,20 * * 0,6"
+    - cron: "0 */4 * * 1-5"   # Every 4h weekdays
+    - cron: "0 8,20 * * 0,6"  # 2x/day weekends
   workflow_dispatch:
 env:
   CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -10,11 +10,7 @@ env:
 jobs:
   smart-money:
     runs-on: ubuntu-latest
-    # S86: First run downloads ~37GB snapshot + decompresses — needs 90-120 min.
-    # Subsequent runs with cache hit are fast (~5 min for Goldsky incremental).
-    # GitHub cache limit is 10GB — decompressed CSV exceeds this, so first run
-    # after cache eviction will re-download. Consider R2 persistent cache later.
-    timeout-minutes: 180
+    timeout-minutes: 10  # S86: API mode runs in ~30s, no more 37GB download
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,33 +19,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install polars requests
-      - name: Cache Goldsky data
-        uses: actions/cache@v4
-        with:
-          path: goldsky/orderFilled.csv
-          key: goldsky-${{ github.run_number }}
-          restore-keys: goldsky-
-      - name: Download snapshot if no cache
-        run: |
-          if [ ! -f goldsky/orderFilled.csv ]; then
-            echo "Downloading snapshot..."
-            mkdir -p goldsky
-            curl -L -o goldsky/orderFilled.csv.xz \
-              https://polydata-archive.s3.us-east-1.amazonaws.com/orderFilled_complete.csv.xz
-            echo "Decompressing (this takes a while)..."
-            xz -d goldsky/orderFilled.csv.xz
-            echo "Done. File size:"
-            ls -lh goldsky/orderFilled.csv
-          else
-            echo "Cache hit — skipping download"
-            ls -lh goldsky/orderFilled.csv
-          fi
-      - name: Install UV and update trades
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          export PATH="$HOME/.local/bin:$PATH"
-          uv sync
-          uv run python update_all.py
-      - name: Run Smart Money Pipeline
-        run: python smart_money_direct.py --poly-data-dir .
+        run: pip install requests
+      - name: Run Smart Money Pipeline (API mode)
+        run: python smart_money_api.py --lookback-days 14
