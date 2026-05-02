@@ -32,7 +32,7 @@ env:
 jobs:
   smart-money:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -50,8 +50,8 @@ jobs:
 
 ## Notes on the YAML changes
 
-1. `timeout-minutes: 10 → 15` — the new step adds ~5-10 min depending on wallet
-   count and trade volume. 15 is comfortable.
+1. `timeout-minutes: 15 → 30` — the new step adds ~5-10 min depending on wallet
+   count and trade volume. 30 is comfortable.
 
 2. `workflow_dispatch.inputs.lifecycles_lookback_days` — adds a manual-run knob
    so you can do a one-shot deep backfill (e.g., 180 days) without editing the
