@@ -1,17 +1,17 @@
 name: JAKUU Smart Money Pipeline
 on:
   schedule:
-    - cron: "0 */4 * * 1-5"   # Every 4h weekdays
-    - cron: "0 8,20 * * 0,6"  # 2x/day weekends
+    - cron: "0 */4 * * 1-5"
+    - cron: "0 8,20 * * 0,6"
   workflow_dispatch:
 env:
   CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # S86: preempt June 2026 deprecation
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 jobs:
   smart-money:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,3 +23,5 @@ jobs:
         run: pip install requests
       - name: Run Smart Money Pipeline (API mode)
         run: python smart_money_api.py --lookback-days 14
+      - name: Dump per-wallet lifecycles for retrospective analysis
+        run: python dump_lifecycles.py --lookback-days 60 --commit
