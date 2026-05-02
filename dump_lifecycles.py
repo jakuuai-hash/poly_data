@@ -1,45 +1,15 @@
 #!/usr/bin/env python3
 """
-JAKUU Lifecycle Dump (S145) — companion to smart_money_api.py
+JAKUU Lifecycle Dump (S145.1) — companion to smart_money_api.py
 
-Where smart_money_api.py builds aggregated *market signals* across the
-smart-money pool, this script builds per-wallet *per-cycle lifecycles* —
-entry/exit pairs joined with market end_date — which are essential for
-retrospective gate analysis on MIRROR candidates.
-
-What it does:
-  1. Reads the wallet list from D1 smart_money_wallets (so Erasmus and any
-     future additions are picked up automatically — no hardcoded list).
-  2. For each wallet, pulls /activity (TRADE + REDEEM) within the lookback
-     window, paginating via the `end` timestamp parameter.
-  3. Batch-fetches market metadata from Gamma for every conditionId seen
-     (gives us closedTime / endDate, which the per-wallet API doesn't include
-     in a reliable, indexable way).
-  4. Pairs BUYs with SELLs/REDEEMs FIFO per (conditionId, outcomeIndex).
-     Each pair is one lifecycle row.
-  5. Computes hours_to_resolution_at_entry (and at_exit) per lifecycle —
-     the missing field that lets us evaluate MIRROR's max-resolution gate.
-  6. Upserts to a new D1 table smart_money_lifecycles.
-
-Idempotent: re-running with overlapping data updates existing rows by ID.
-The ID is sha256(wallet|conditionId|outcomeIdx|entry_tx_hash|entry_ts) so
-the same lifecycle gets the same row whether it's first seen as 'open' and
-later closed via a sell, or seen complete from the start.
-
-Usage:
-  python dump_lifecycles.py --dry-run                          # preview only
-  python dump_lifecycles.py --commit                           # write to D1
-  python dump_lifecycles.py --lookback-days 90 --commit        # deeper history
-  python dump_lifecycles.py --wallet 0xc6587b… --dry-run       # single wallet preview
+S145.1 changes vs S145:
+  * MAX_RECORDS_PER_WALLET cap (default 15000) — skips MM wallets that
+    would eat the GitHub Actions timeout budget.
+  * Per-wallet streaming upsert — pair and write per wallet, not all at
+    end. If timeout hits mid-run, partial data is already persisted.
 """
 
-import os
-import sys
-import time
-import json
-import hashlib
-import logging
-import argparse
+import os, sys, time, hashlib, logging, argparse
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
@@ -54,17 +24,14 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
 DEFAULT_LOOKBACK_DAYS = 60
 PAGE_SIZE = 500
-MIN_USD_TRADE = 1.0          # filter dust airdrops; keep meaningful trades
-GAMMA_BATCH_SIZE = 50        # /markets?conditionIds= can take many at once
-REQUEST_PAUSE_S = 0.3        # rate-limit courtesy
+MAX_RECORDS_PER_WALLET = 15000
+MIN_USD_TRADE = 1.0
+GAMMA_BATCH_SIZE = 50
+REQUEST_PAUSE_S = 0.3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dump_lifecycles")
 
-
-# ───────────────────────────────────────────────────────────────────────────
-# SCHEMA — embedded so the script self-bootstraps (CREATE IF NOT EXISTS)
-# ───────────────────────────────────────────────────────────────────────────
 SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS smart_money_lifecycles (
         id TEXT PRIMARY KEY,
@@ -99,9 +66,6 @@ SCHEMA_STATEMENTS = [
 ]
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# D1 client
-# ───────────────────────────────────────────────────────────────────────────
 class D1Client:
     def __init__(self, account_id, api_token, database_id):
         self.url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query"
@@ -119,11 +83,7 @@ class D1Client:
         return data.get("result", [{}])[0]
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Helpers
-# ───────────────────────────────────────────────────────────────────────────
 def parse_ts(ts_raw):
-    """ISO string or epoch seconds → tz-aware datetime UTC. None on failure."""
     if ts_raw is None or ts_raw == "":
         return None
     if isinstance(ts_raw, (int, float)):
@@ -143,38 +103,23 @@ def round_or_none(v, ndigits):
     return round(v, ndigits) if v is not None else None
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Polymarket Data API: paginated activity fetch
-# ───────────────────────────────────────────────────────────────────────────
-def fetch_wallet_activity(address, lookback_days):
-    """
-    Fetch ALL trade + redeem activity for a wallet within the lookback window.
-
-    PM Data API /activity supports `start`/`end` (epoch seconds), `sortBy`,
-    `sortDirection`, `limit`. To paginate beyond 500, we fetch DESC and pass
-    `end = earliest_ts_seen - 1` on each subsequent call.
-
-    Returns: list of raw activity records, each with `_parsed_ts` attached.
-    """
+def fetch_wallet_activity(address, lookback_days, max_records):
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     cutoff_epoch = int(cutoff.timestamp())
     all_records = []
     seen_tx = set()
     end_param = None
     page = 0
+    truncated = False
 
     while True:
         page += 1
         params = {
-            "user": address,
-            "type": "TRADE,REDEEM",
-            "limit": PAGE_SIZE,
-            "sortBy": "TIMESTAMP",
-            "sortDirection": "DESC",
+            "user": address, "type": "TRADE,REDEEM",
+            "limit": PAGE_SIZE, "sortBy": "TIMESTAMP", "sortDirection": "DESC",
         }
         if end_param is not None:
             params["end"] = end_param
-
         try:
             r = requests.get(f"{DATA_API_BASE}/activity", params=params, timeout=30)
             r.raise_for_status()
@@ -197,33 +142,30 @@ def fetch_wallet_activity(address, lookback_days):
             if ts is None:
                 continue
             if ts < cutoff:
-                # remaining records are even older (DESC order) — done
-                return all_records
+                return all_records, truncated
             seen_tx.add(tx)
             item["_parsed_ts"] = ts
             all_records.append(item)
             new_count += 1
             if earliest_ts is None or ts < earliest_ts:
                 earliest_ts = ts
+            if len(all_records) >= max_records:
+                log.warning("    HIT MAX_RECORDS cap (%d) — likely MM wallet, stopping", max_records)
+                truncated = True
+                return all_records, truncated
 
-        # If page wasn't full, we've drained everything in window
         if len(items) < PAGE_SIZE or new_count == 0 or earliest_ts is None:
             break
-
         next_end = int(earliest_ts.timestamp()) - 1
         if next_end < cutoff_epoch:
             break
         end_param = next_end
         time.sleep(REQUEST_PAUSE_S)
 
-    return all_records
+    return all_records, truncated
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Gamma metadata: market end_date per conditionId
-# ───────────────────────────────────────────────────────────────────────────
 def fetch_markets_metadata(condition_ids):
-    """Return dict cid_lower → {end_date, question} for every cid we can resolve."""
     out = {}
     cid_list = sorted({c.lower() for c in condition_ids if c})
     for i in range(0, len(cid_list), GAMMA_BATCH_SIZE):
@@ -247,17 +189,7 @@ def fetch_markets_metadata(condition_ids):
     return out
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Lifecycle pairing — FIFO BUY → SELL/REDEEM
-# ───────────────────────────────────────────────────────────────────────────
 def pair_lifecycles_fifo(wallet, alias, records, market_meta):
-    """
-    Group records by (conditionId, outcomeIndex). Within each group, sort by
-    timestamp ascending and pair BUYs with SELLs/REDEEMs FIFO. Each pair is
-    one lifecycle row. Unmatched buys → exit_type='open'.
-
-    Returns: list of lifecycle row dicts ready for D1 upsert.
-    """
     by_market = defaultdict(list)
     for rec in records:
         cid = rec.get("conditionId") or rec.get("condition_id")
@@ -276,7 +208,6 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
         question = (meta.get("question") if meta else None) or trades[0].get("title") or ""
         outcome_str = trades[0].get("outcome") or ("Yes" if oidx == 0 else "No")
 
-        # FIFO queue of open BUYs: each = {ts, price, shares_remaining, cost_remaining, tx}
         open_buys = deque()
 
         for t in trades:
@@ -290,13 +221,9 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
 
             if kind == "TRADE" and side == "BUY":
                 if shares > 0 and usd >= MIN_USD_TRADE:
-                    open_buys.append({
-                        "ts": ts, "price": price,
-                        "shares_remaining": shares,
-                        "cost_remaining": usd,
-                        "tx": tx,
-                    })
-
+                    open_buys.append({"ts": ts, "price": price,
+                                      "shares_remaining": shares,
+                                      "cost_remaining": usd, "tx": tx})
             elif kind == "TRADE" and side == "SELL":
                 shares_to_close = shares
                 proceeds_per_share = price
@@ -314,18 +241,13 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                         entry_cost=cost_taken, entry_tx=buy["tx"],
                         exit_ts=ts, exit_price=proceeds_per_share,
                         exit_proceeds=proceeds, exit_tx=tx, exit_type="sell",
-                        computed_at=now_iso,
-                    ))
+                        computed_at=now_iso))
                     buy["shares_remaining"] -= take
                     buy["cost_remaining"] -= cost_taken
                     shares_to_close -= take
                     if buy["shares_remaining"] <= 1e-9:
                         open_buys.popleft()
-                # leftover sell with no matching buy = position established before window — drop
-
             elif kind == "REDEEM":
-                # Close all remaining buys at this market at the redemption price.
-                # PM /activity REDEEM events report price=1 for winning outcome, 0 for losing.
                 redeem_price = price
                 while open_buys:
                     buy = open_buys.popleft()
@@ -339,10 +261,8 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                         entry_cost=buy["cost_remaining"], entry_tx=buy["tx"],
                         exit_ts=ts, exit_price=redeem_price, exit_proceeds=proceeds,
                         exit_tx=tx, exit_type=("redeem_win" if redeem_price > 0.5 else "redeem_loss"),
-                        computed_at=now_iso,
-                    ))
+                        computed_at=now_iso))
 
-        # Open positions remaining after all events processed
         for buy in open_buys:
             if buy["shares_remaining"] <= 1e-9:
                 continue
@@ -350,11 +270,8 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                 wallet, alias, cid, oidx, outcome_str, question, end_dt,
                 entry_ts=buy["ts"], entry_price=buy["price"],
                 entry_shares=buy["shares_remaining"], entry_cost=buy["cost_remaining"],
-                entry_tx=buy["tx"],
-                exit_ts=None, exit_price=None, exit_proceeds=None,
-                exit_tx=None, exit_type="open",
-                computed_at=now_iso,
-            ))
+                entry_tx=buy["tx"], exit_ts=None, exit_price=None, exit_proceeds=None,
+                exit_tx=None, exit_type="open", computed_at=now_iso))
 
     return lifecycles
 
@@ -368,20 +285,14 @@ def _build_lifecycle(wallet, alias, cid, oidx, outcome_str, question, end_dt,
     h2r_entry = ((end_dt - entry_ts).total_seconds() / 3600.0) if end_dt else None
     h2r_exit = ((end_dt - exit_ts).total_seconds() / 3600.0) if (end_dt and exit_ts) else None
 
-    # Deterministic ID → idempotent upsert. Includes entry_ts to disambiguate
-    # multiple sub-buys from the same tx that get sliced into separate lifecycles.
     id_input = f"{wallet}|{cid}|{oidx}|{entry_tx}|{entry_ts.isoformat()}|{round(entry_shares, 4)}"
     row_id = hashlib.sha256(id_input.encode()).hexdigest()[:24]
 
     return {
-        "id": row_id,
-        "wallet_address": wallet.lower(),
-        "wallet_alias": alias,
-        "condition_id": str(cid),
-        "market_question": str(question)[:500],
+        "id": row_id, "wallet_address": wallet.lower(), "wallet_alias": alias,
+        "condition_id": str(cid), "market_question": str(question)[:500],
         "market_end_date": end_dt.isoformat() if end_dt else None,
-        "outcome": str(outcome_str)[:32],
-        "outcome_index": int(oidx),
+        "outcome": str(outcome_str)[:32], "outcome_index": int(oidx),
         "entry_ts": entry_ts.isoformat(),
         "entry_price": round_or_none(entry_price, 6),
         "entry_shares": round_or_none(entry_shares, 4),
@@ -401,9 +312,6 @@ def _build_lifecycle(wallet, alias, cid, oidx, outcome_str, question, end_dt,
     }
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# D1 upsert helpers
-# ───────────────────────────────────────────────────────────────────────────
 def fetch_registry_wallets(d1):
     res = d1.query("SELECT address, alias FROM smart_money_wallets")
     return [(row["address"].lower(), row.get("alias") or row["address"][:10])
@@ -421,122 +329,104 @@ def upsert_lifecycle(d1, row):
     d1.query(sql, [row[c] for c in cols])
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Main
-# ───────────────────────────────────────────────────────────────────────────
 def main():
-    p = argparse.ArgumentParser(description="JAKUU per-wallet lifecycle dump (S145)")
+    p = argparse.ArgumentParser()
     p.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
-    p.add_argument("--commit", action="store_true", help="Write to D1 (default: dry-run)")
-    p.add_argument("--dry-run", action="store_true", help="Force dry-run even if --commit set")
+    p.add_argument("--max-records", type=int, default=MAX_RECORDS_PER_WALLET)
+    p.add_argument("--commit", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("--wallet", help="Limit to single wallet address (hex)")
     args = p.parse_args()
-
     dry_run = args.dry_run or not args.commit
 
     log.info("=" * 60)
-    log.info("JAKUU Lifecycle Dump (S145)")
+    log.info("JAKUU Lifecycle Dump (S145.1)")
     log.info("=" * 60)
-    log.info("Lookback: %d days | Mode: %s", args.lookback_days,
-             "DRY-RUN (no D1 writes)" if dry_run else "COMMIT")
+    log.info("Lookback: %d days | Max records/wallet: %d | Mode: %s",
+             args.lookback_days, args.max_records,
+             "DRY-RUN" if dry_run else "COMMIT")
 
     if not dry_run and (not CF_ACCOUNT_ID or not CF_API_TOKEN):
-        log.error("Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN env vars (or use --dry-run)")
+        log.error("Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN env vars")
         sys.exit(1)
 
     d1 = D1Client(CF_ACCOUNT_ID, CF_API_TOKEN, D1_DATABASE_ID) if not dry_run else None
 
-    # 1. Bootstrap schema (idempotent)
     if not dry_run:
         log.info("Ensuring smart_money_lifecycles table + indexes exist...")
         for stmt in SCHEMA_STATEMENTS:
             d1.query(stmt)
 
-    # 2. Resolve wallet list
     if args.wallet:
         wallets = [(args.wallet.lower(), "ad-hoc")]
     elif dry_run:
-        # Try reading registry if creds available; else preview Erasmus only
         if CF_ACCOUNT_ID and CF_API_TOKEN:
-            d1_ro = D1Client(CF_ACCOUNT_ID, CF_API_TOKEN, D1_DATABASE_ID)
-            wallets = fetch_registry_wallets(d1_ro)
+            wallets = fetch_registry_wallets(D1Client(CF_ACCOUNT_ID, CF_API_TOKEN, D1_DATABASE_ID))
         else:
-            log.warning("Dry-run with no creds: previewing Erasmus only")
             wallets = [("0xc6587b11a2209e46dfe3928b31c5514a8e33b784", "Erasmus.")]
     else:
         wallets = fetch_registry_wallets(d1)
     log.info("Wallets to process: %d", len(wallets))
 
-    # 3. Per-wallet: fetch activity
-    wallet_records = {}
-    all_cids = set()
-    for addr, alias in wallets:
-        log.info("Fetching activity for %s (%s)...", alias, addr[:10])
-        records = fetch_wallet_activity(addr, args.lookback_days)
-        log.info("  → %d records in lookback window", len(records))
-        wallet_records[addr] = (alias, records)
-        for r in records:
-            cid = r.get("conditionId") or r.get("condition_id")
-            if cid:
-                all_cids.add(str(cid))
-        time.sleep(0.5)
+    market_meta = {}
+    cids_resolved = set()
+    grand = {"lc": 0, "ok": 0, "skip": 0, "ups": 0, "fail": 0}
 
-    # 4. Batch-fetch market metadata
-    log.info("Fetching Gamma metadata for %d markets...", len(all_cids))
-    market_meta = fetch_markets_metadata(all_cids)
-    missing = len(all_cids) - len(market_meta)
-    log.info("  → %d markets resolved (%d missing — likely closed/archived)",
-             len(market_meta), missing)
-
-    # 5. Pair lifecycles
-    all_lifecycles = []
-    for addr, (alias, records) in wallet_records.items():
-        lcs = pair_lifecycles_fifo(addr, alias, records, market_meta)
-        log.info("  %s: %d lifecycles paired", alias, len(lcs))
-        all_lifecycles.extend(lcs)
-
-    # 6. Quick stats
-    log.info("")
-    log.info("Total lifecycles: %d", len(all_lifecycles))
-    closed = [l for l in all_lifecycles if l["exit_ts"] is not None]
-    if closed:
-        wins = sum(1 for l in closed if (l.get("pnl_usd") or 0) > 0)
-        total_pnl = sum(l.get("pnl_usd") or 0 for l in closed)
-        log.info("  Closed: %d | Wins: %d (%.0f%%) | Total PnL: $%+,.2f",
-                 len(closed), wins, 100 * wins / len(closed), total_pnl)
-        h2rs = sorted([l["hours_to_resolution_at_entry"] for l in all_lifecycles
-                       if l["hours_to_resolution_at_entry"] is not None])
-        if h2rs:
-            n = len(h2rs)
-            below_24h = sum(1 for h in h2rs if h <= 24)
-            log.info("  hours_to_resolution_at_entry: p25=%.1f p50=%.1f p75=%.1f max=%.0f",
-                     h2rs[n // 4], h2rs[n // 2], h2rs[3 * n // 4], h2rs[-1])
-            log.info("  Cycles entering ≤24h before resolution: %d / %d (%.0f%%)",
-                     below_24h, n, 100 * below_24h / n)
-
-    if dry_run:
+    for idx, (addr, alias) in enumerate(wallets, 1):
         log.info("")
-        log.info("[DRY-RUN] Skipping D1 writes. Pass --commit to persist.")
-        return
-
-    # 7. Upsert
-    log.info("")
-    log.info("Upserting %d lifecycles to D1...", len(all_lifecycles))
-    written = 0
-    failed = 0
-    for lc in all_lifecycles:
+        log.info("[%d/%d] %s (%s)...", idx, len(wallets), alias, addr[:10])
         try:
-            upsert_lifecycle(d1, lc)
-            written += 1
-            if written % 50 == 0:
-                log.info("  %d/%d written", written, len(all_lifecycles))
-                time.sleep(0.5)
+            records, truncated = fetch_wallet_activity(addr, args.lookback_days, args.max_records)
         except Exception as e:
-            failed += 1
-            if failed <= 5:
-                log.warning("  Upsert failed: %s", e)
+            log.warning("  Fetch failed: %s", e)
+            grand["skip"] += 1
+            continue
+
+        log.info("  -> %d records%s", len(records), " (TRUNCATED)" if truncated else "")
+        if truncated:
+            log.info("  Skipping MM wallet (oracle_signal-only)")
+            grand["skip"] += 1
+            continue
+        if not records:
+            grand["ok"] += 1
+            continue
+
+        wallet_cids = {r.get("conditionId") or r.get("condition_id") for r in records}
+        wallet_cids.discard(None)
+        new_cids = {str(c) for c in wallet_cids if str(c).lower() not in cids_resolved}
+        if new_cids:
+            log.info("  Fetching Gamma metadata for %d new markets...", len(new_cids))
+            market_meta.update(fetch_markets_metadata(new_cids))
+            cids_resolved.update(c.lower() for c in new_cids)
+
+        lifecycles = pair_lifecycles_fifo(addr, alias, records, market_meta)
+        log.info("  -> %d lifecycles paired", len(lifecycles))
+        grand["lc"] += len(lifecycles)
+
+        if dry_run or not lifecycles:
+            grand["ok"] += 1
+            continue
+
+        log.info("  Upserting...")
+        written = 0; failed = 0
+        for lc in lifecycles:
+            try:
+                upsert_lifecycle(d1, lc)
+                written += 1
+                if written % 50 == 0:
+                    time.sleep(0.3)
+            except Exception as e:
+                failed += 1
+                if failed <= 3:
+                    log.warning("    Upsert error: %s", e)
+        log.info("  -> %d upserted, %d failed", written, failed)
+        grand["ups"] += written; grand["fail"] += failed; grand["ok"] += 1
+        time.sleep(0.3)
+
     log.info("")
-    log.info("Done. %d upserted, %d failed.", written, failed)
+    log.info("=" * 60)
+    log.info("Done. Processed: %d | Skipped MM: %d | Lifecycles: %d | Upserts: %d | Failed: %d",
+             grand["ok"], grand["skip"], grand["lc"], grand["ups"], grand["fail"])
 
 
 if __name__ == "__main__":
