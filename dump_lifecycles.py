@@ -1,23 +1,51 @@
 #!/usr/bin/env python3
 """
-JAKUU Smart-Money Lifecycle Dump — S145.2
+JAKUU Smart-Money Lifecycle Dump — S147 (corrigendum patch)
 
 Pulls /activity history for every wallet in smart_money_wallets,
-pairs entries to exits via FIFO, joins with Gamma market endDate,
-and upserts complete lifecycles into smart_money_lifecycles.
+pairs entries to exits via FIFO, joins with Gamma market metadata
+(endDate, event_id, resolution), and upserts complete lifecycles
+into smart_money_lifecycles.
 
-S145.2 changes vs S145.1:
-  (1) Gamma metadata: per-conditionId loop instead of broken batch query.
-      The batch path (?conditionIds=A&conditionIds=B&...) returns at most
-      one match — verified empirically (1/104 markets resolved on run #91).
-  (2) Wallet priority ordering: mirror_copy first, then oracle_signal,
-      then alpha within tier. Ensures Erasmus dumps before whales when
-      timeout pressure exists.
-  (3) MAX_RECORDS_PER_WALLET cap (15000) preserved from S145.1.
-  (4) Per-wallet streaming upsert preserved — partial saves on timeout.
+S147 changes vs S145.2 (per JAKUU_MIRROR_FRAMEWORK.md v1.2):
+  (A) Gamma metadata now ALSO returns event_id (markets[0].events[0].id),
+      `closed` flag, and parsed outcomePrices for resolution detection.
+      No second API call required — events nest under /markets response.
+      Spec said "fetch event_id from /events/by-condition"; the live
+      Gamma /markets?conditionIds=X already returns events nested. Saves
+      one round-trip per condition_id vs the original spec.
+  (B) Synthetic Gamma-derived REDEEM lifecycles for unpaired open buys
+      where the underlying market has resolved. Fixes the survivorship
+      bias documented in S146: PM /activity exposes only TRADE events,
+      never REDEEM, so hold-to-redeem losers had ZERO rows in the
+      lifecycle table. Now closed at exit_price ∈ {0.0, 1.0} based on
+      Gamma `closed=true` + `outcomePrices`. exit_type:
+        "redeem_synth_win"  — wallet's outcome won  (price=1.0)
+        "redeem_synth_loss" — wallet's outcome lost (price=0.0)
+      These are SYNTHETIC; exit_tx_hash=NULL. Distinguishable from
+      real on-chain REDEEMs (kept as exit_type="redeem_win"/"redeem_loss")
+      so analyses can opt to include or exclude.
+  (C) Lifecycle row schema: `event_id TEXT` field added. Requires
+      D1 migration M1.6.A run BEFORE this script (see migration sql
+      header in repo). Existing rows get NULL until re-dumped.
+  (D) Resolution detection threshold: matches the framework spec —
+      `closed == True` AND outcomePrices[winner] >= 0.95 (or <= 0.05
+      on the loser side). Prevents counting markets that "closed" for
+      trading but are awaiting UMA finalization.
+
+S145.2 changes preserved:
+  (1) Per-conditionId Gamma loop (batch query is broken).
+  (2) Wallet priority ordering.
+  (3) MAX_RECORDS_PER_WALLET cap.
+  (4) Streaming upsert.
+
+Compatibility: this script REQUIRES the M1.6.A migration. Run it first:
+  ALTER TABLE smart_money_lifecycles ADD COLUMN event_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_sml_wallet_event
+    ON smart_money_lifecycles(wallet_address, event_id);
 """
 
-import os, sys, time, hashlib, logging
+import os, sys, time, json, hashlib, logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 import requests
@@ -183,9 +211,20 @@ def fetch_wallet_activity(address):
 
 def fetch_market_metadata_one(condition_id):
     """
-    Per-id Gamma lookup. The batch path (?conditionIds=A&conditionIds=B)
-    returns ≤1 result when conditionIds is repeated — broken in S145.1.
-    Per-id is slower but correct.
+    Per-id Gamma lookup. Returns endDate, question, event_id, and
+    resolution state for synthetic-REDEEM synthesis.
+
+    Per-id is slower but correct: the batch path
+    (?conditionIds=A&conditionIds=B) returns ≤1 result when conditionIds
+    is repeated — verified broken in S145.1.
+
+    S147 additions (corrigendum patch):
+      - event_id from m.events[0].id (events array nests under markets;
+        no second /events call required).
+      - closed: bool — Gamma `closed` flag (orderbook closed for trades).
+      - resolved_yes: True/False/None — derived from `outcomePrices`
+        with >=0.95 / <=0.05 threshold. None when market is not cleanly
+        resolved (still open, awaiting UMA, or borderline).
     """
     try:
         r = requests.get(
@@ -198,9 +237,43 @@ def fetch_market_metadata_one(condition_id):
         if not items:
             return None
         m = items[0] if isinstance(items, list) else items
+
+        # event_id: markets nest events under .events[]; canonical
+        # path is events[0].id. Defensive guard for shape variance.
+        event_id = None
+        evs = m.get("events")
+        if isinstance(evs, list) and evs:
+            ev0 = evs[0]
+            if isinstance(ev0, dict):
+                eid = ev0.get("id")
+                if eid is not None:
+                    event_id = str(eid)
+
+        # Resolution state. Only mark resolved_yes for clean resolutions
+        # (outcome price >= 0.95 / <= 0.05). Markets that "closed" but
+        # await UMA finalization stay resolved_yes=None.
+        closed_flag = bool(m.get("closed"))
+        resolved_yes = None
+        if closed_flag:
+            try:
+                op_raw = m.get("outcomePrices")
+                op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+                if isinstance(op, list) and len(op) >= 2:
+                    yes_p = float(op[0])
+                    if yes_p >= 0.95:
+                        resolved_yes = True
+                    elif yes_p <= 0.05:
+                        resolved_yes = False
+                    # else: borderline, leave as None
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+
         return {
             "end_date": m.get("endDate") or m.get("end_date_iso"),
             "question": m.get("question"),
+            "event_id": event_id,
+            "closed": closed_flag,
+            "resolved_yes": resolved_yes,
         }
     except Exception as e:
         log.debug("  Gamma miss for %s: %s", condition_id[:10], e)
@@ -222,15 +295,21 @@ def fetch_markets_metadata(condition_ids):
         if i % 25 == 0:
             log.info("    %d/%d (%d hits)", i, len(cid_list), hit)
         time.sleep(GAMMA_PAUSE_S)
+    n = len(cid_list)
+    with_event = sum(1 for v in out.values() if v.get("event_id"))
+    resolved = sum(1 for v in out.values() if v.get("resolved_yes") is not None)
     log.info(
-        "  Gamma: %d/%d resolved (%.0f%%)",
-        hit, len(cid_list), 100.0 * hit / len(cid_list),
+        "  Gamma: %d/%d hit (%.0f%%), %d with event_id (%.0f%%), "
+        "%d cleanly resolved (%.0f%%)",
+        hit, n, 100.0 * hit / n if n else 0,
+        with_event, 100.0 * with_event / n if n else 0,
+        resolved, 100.0 * resolved / n if n else 0,
     )
     return out
 
 
 def _build_lifecycle(
-    wallet, alias, cid, oidx, outcome_str, question, end_dt,
+    wallet, alias, cid, oidx, outcome_str, question, end_dt, event_id,
     entry_ts, entry_price, entry_shares, entry_cost, entry_tx,
     exit_ts, exit_price, exit_proceeds, exit_tx, exit_type, computed_at,
 ):
@@ -251,6 +330,7 @@ def _build_lifecycle(
         "wallet_address": wallet.lower(),
         "wallet_alias": alias,
         "condition_id": str(cid),
+        "event_id": str(event_id) if event_id else None,
         "market_question": str(question)[:500],
         "market_end_date": end_dt.isoformat() if end_dt else None,
         "outcome": str(outcome_str)[:32],
@@ -285,6 +365,7 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
 
     lifecycles = []
     now_iso = datetime.now(timezone.utc).isoformat()
+    synth_redeem_count = 0  # track synthetic-REDEEM emission for logging
 
     for (cid, oidx), trades in by_market.items():
         trades.sort(key=lambda t: t["_parsed_ts"])
@@ -292,6 +373,9 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
         end_dt = parse_ts(meta.get("end_date")) if meta else None
         question = (meta.get("question") if meta else None) or trades[0].get("title") or ""
         outcome_str = trades[0].get("outcome") or ("Yes" if oidx == 0 else "No")
+        event_id = (meta.get("event_id") if meta else None)
+        market_closed = bool(meta.get("closed")) if meta else False
+        resolved_yes = meta.get("resolved_yes") if meta else None
 
         open_buys = deque()
         for t in trades:
@@ -325,7 +409,7 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                     cost_taken = buy["cost_remaining"] * (take / buy["shares_remaining"])
                     proceeds = take * proceeds_per_share
                     lifecycles.append(_build_lifecycle(
-                        wallet, alias, cid, oidx, outcome_str, question, end_dt,
+                        wallet, alias, cid, oidx, outcome_str, question, end_dt, event_id,
                         entry_ts=buy["ts"], entry_price=buy["price"],
                         entry_shares=take, entry_cost=cost_taken, entry_tx=buy["tx"],
                         exit_ts=ts, exit_price=proceeds_per_share,
@@ -339,6 +423,9 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                         open_buys.popleft()
 
             elif kind == "REDEEM":
+                # On-chain REDEEM event surfaced in /activity. Rare —
+                # /activity historically returns only TRADE events. If it
+                # does appear, prefer it over our synthetic version.
                 redeem_price = price
                 while open_buys:
                     buy = open_buys.popleft()
@@ -347,7 +434,7 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                         continue
                     proceeds = take * redeem_price
                     lifecycles.append(_build_lifecycle(
-                        wallet, alias, cid, oidx, outcome_str, question, end_dt,
+                        wallet, alias, cid, oidx, outcome_str, question, end_dt, event_id,
                         entry_ts=buy["ts"], entry_price=buy["price"],
                         entry_shares=take, entry_cost=buy["cost_remaining"],
                         entry_tx=buy["tx"], exit_ts=ts, exit_price=redeem_price,
@@ -356,18 +443,52 @@ def pair_lifecycles_fifo(wallet, alias, records, market_meta):
                         computed_at=now_iso,
                     ))
 
+        # ─── Unpaired-buy resolution (S147 corrigendum patch) ─────────
+        # Any buy still open in the deque at this point was not paired
+        # to a SELL or on-chain REDEEM. Three cases:
+        #   (a) Gamma says the market resolved cleanly → synthesize
+        #       a redeem_synth_{win,loss} lifecycle at exit_price ∈ {0,1}
+        #       per the wallet's outcome side. exit_tx_hash=NULL marks
+        #       it as synthesized.
+        #   (b) Gamma says the market is closed but resolution is
+        #       borderline / awaiting UMA → leave as exit_type="open".
+        #       Better to under-count than to mislabel.
+        #   (c) Gamma says the market is still open → leave as "open".
         for buy in open_buys:
             if buy["shares_remaining"] <= 1e-9:
                 continue
+
+            # Default = open. Only override if market is cleanly resolved.
+            exit_type_synth = "open"
+            exit_price_synth = None
+            exit_proceeds_synth = None
+            exit_ts_synth = None
+
+            if market_closed and resolved_yes is not None:
+                # Wallet's outcome side: oidx=0 == YES, oidx=1 == NO.
+                wallet_won = (resolved_yes is True and oidx == 0) or \
+                             (resolved_yes is False and oidx == 1)
+                exit_price_synth = 1.0 if wallet_won else 0.0
+                exit_proceeds_synth = buy["shares_remaining"] * exit_price_synth
+                # Use market endDate as the exit timestamp when known;
+                # fall back to computed_at. This keeps hold_hours sensible.
+                exit_ts_synth = end_dt if end_dt else datetime.now(timezone.utc)
+                exit_type_synth = "redeem_synth_win" if wallet_won else "redeem_synth_loss"
+                synth_redeem_count += 1
+
             lifecycles.append(_build_lifecycle(
-                wallet, alias, cid, oidx, outcome_str, question, end_dt,
+                wallet, alias, cid, oidx, outcome_str, question, end_dt, event_id,
                 entry_ts=buy["ts"], entry_price=buy["price"],
                 entry_shares=buy["shares_remaining"],
                 entry_cost=buy["cost_remaining"], entry_tx=buy["tx"],
-                exit_ts=None, exit_price=None, exit_proceeds=None,
-                exit_tx=None, exit_type="open", computed_at=now_iso,
+                exit_ts=exit_ts_synth, exit_price=exit_price_synth,
+                exit_proceeds=exit_proceeds_synth,
+                exit_tx=None,  # synthetic — no on-chain tx
+                exit_type=exit_type_synth, computed_at=now_iso,
             ))
 
+    if synth_redeem_count:
+        log.info("    Synthetic REDEEMs emitted: %d", synth_redeem_count)
     return lifecycles
 
 
@@ -404,9 +525,22 @@ def process_wallet(d1, address, alias):
     lifecycles = pair_lifecycles_fifo(address, alias, records, market_meta)
     closed = sum(1 for lc in lifecycles if lc["exit_ts"] is not None)
     with_meta = sum(1 for lc in lifecycles if lc["market_end_date"] is not None)
+    with_event = sum(1 for lc in lifecycles if lc.get("event_id"))
+    synth_redeems = sum(
+        1 for lc in lifecycles
+        if lc.get("exit_type") in ("redeem_synth_win", "redeem_synth_loss")
+    )
+    distinct_events = len({lc["event_id"] for lc in lifecycles if lc.get("event_id")})
+    distinct_cids = len({lc["condition_id"] for lc in lifecycles})
     log.info(
-        "  -> %d lifecycles (%d closed, %d with end_date metadata)",
-        len(lifecycles), closed, with_meta,
+        "  -> %d lifecycles (%d closed, %d with end_date, %d with event_id)",
+        len(lifecycles), closed, with_meta, with_event,
+    )
+    log.info(
+        "     %d synthetic REDEEMs | %d distinct events | %d distinct condition_ids "
+        "(collapse ratio %.2fx)",
+        synth_redeems, distinct_events, distinct_cids,
+        (distinct_cids / distinct_events) if distinct_events else 0.0,
     )
 
     log.info("  Upserting...")
