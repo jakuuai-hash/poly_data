@@ -11,7 +11,7 @@ env:
 jobs:
   smart-money:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -21,11 +21,7 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install requests
-      # TEMPORARY S147: skip smart_money_api to reserve full 90min for dump.
-      # Cron at :00 every 4h still refreshes signals separately.
-      # Restore by removing the `if: false` line below.
       - name: Run Smart Money Pipeline (API mode)
-        if: false
         run: python smart_money_api.py --lookback-days 14
       - name: Dump per-wallet lifecycles for retrospective analysis
         run: python dump_lifecycles.py --lookback-days 60 --commit
